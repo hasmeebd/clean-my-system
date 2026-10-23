@@ -1,0 +1,50 @@
+# Build output and dependencies
+/target/
+src-tauri/target/
+/dist/
+node_modules/
+bin/
+obj/
+
+# Tauri generated schemas (recreated by tauri-build)
+src-tauri/gen/
+
+# Logs
+*.log
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+secrets*
+
+# Models, media, data (never commit)
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.bin
+*.pkl
+*.h5
+*.zip
+*.7z
+*.rar
+*.db
+*.sqlite
+*.parquet
+
+# Personal screenshots (show local paths)
+/screens/
+
+# OS / editors
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vs/
+.vscode/
+.idea/
