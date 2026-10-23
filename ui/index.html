@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clean My System</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="side">
+      <div class="brand">
+        <div class="logo"></div>
+        <div><b>Clean My System</b><small>R&amp;D by OOFFOO</small></div>
+      </div>
+      <nav id="nav"></nav>
+      <div class="side-foot">
+        <div id="adminBadge"></div>
+        <div id="ollamaBadge"></div>
+        <div class="credit">R&amp;D by <b>OOFFOO</b><br>Developed by <b>HB Mostafa</b></div>
+      </div>
+    </aside>
+    <main id="main">
+      <header id="driveBar"></header>
+      <div id="busy" class="busy hidden">
+        <div class="spin"></div>
+        <span id="busyText">Working…</span>
+        <button class="btn sm" id="busyCancel">Cancel</button>
+      </div>
+      <section id="view"></section>
+    </main>
+  </div>
+  <div id="modalRoot"></div>
+  <div id="toasts"></div>
+  <script src="app.js"></script>
+</body>
+</html>
