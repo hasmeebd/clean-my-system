@@ -9,7 +9,7 @@
    In the Visual Studio installer select the "Desktop development with C++" workload.
 2. Clone and build:
    ```powershell
-   git clone https://github.com/hasmeebd/clean-my-system.git
+   git clone https://github.com/hasmeebd/system-care-suite.git
    cd clean-my-system\src-tauri
    cargo build --release --locked
    ```

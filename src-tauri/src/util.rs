@@ -320,6 +320,10 @@ pub struct Settings {
     pub junk_roots: Vec<String>,
     /// A project counts as stale after this many days without activity.
     pub junk_stale_days: u64,
+    /// Safe-clean targets the scheduled task may run.
+    pub auto_clean_ids: Vec<String>,
+    /// Closing the window keeps the app in the system tray.
+    pub close_to_tray: bool,
 }
 
 impl Default for Settings {
@@ -329,10 +333,12 @@ impl Default for Settings {
             lang: "bn".into(),
             ollama_host: "http://127.0.0.1:11434".into(),
             quarantine_days: 7,
-            protected: Vec::new(),
+            protected: vec![format!("{}\\Desktop\\Arian", profile().display())],
             think: std::collections::HashMap::new(),
             junk_roots: Vec::new(),
             junk_stale_days: 30,
+            auto_clean_ids: vec!["user_temp".into(), "crash_dumps".into()],
+            close_to_tray: false,
         }
     }
 }

@@ -1,17 +1,19 @@
 [package]
 name = "cdrive-studio"
 version = "0.1.0"
-description = "Clean My System (R&D by OOFFOO, developed by HB Mostafa) - disk analyzer and cleaner with a local Ollama assistant"
+description = "System Care Suite (R&D by OOFFOO, developed by HB Mostafa) - disk analyzer and cleaner with a local Ollama assistant"
 edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1.10"
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+winreg = "0.52"
 ureq = { version = "2", default-features = false, features = ["json"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -19,6 +21,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     "Win32_Security",
     "Win32_System_IO",
+    "Win32_System_SystemInformation",
 ] }
 
 [features]

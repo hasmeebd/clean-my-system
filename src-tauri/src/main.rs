@@ -1,11 +1,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod apps;
+mod browsers;
+mod diag;
 mod devjunk;
+mod dupes;
 mod finder;
+mod fixes;
+mod health;
 mod hogs;
+mod procs;
+mod ps;
 mod quarantine;
+mod recover;
 mod safety;
+mod schedule;
+mod startup;
+mod tweaks;
+mod updater;
 mod util;
 
 use rayon::prelude::*;
@@ -21,7 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use util::*;
 
 struct AppState {
@@ -31,6 +44,7 @@ struct AppState {
     folder: Arc<Mutex<Option<FolderView>>>,
     settings: Arc<Mutex<Settings>>,
     ai_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    fix_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 // ------------------------------------------------------------ progress events
@@ -664,9 +678,292 @@ async fn ai_search(
     .map_err(join_err)?
 }
 
+// ------------------------------------------------------------ duplicates
+
+#[tauri::command]
+async fn find_duplicates(app: AppHandle, state: State<'_, AppState>, roots: Vec<String>, min_mb: f64) -> Result<dupes::DupReport, String> {
+    let cancel = state.cancel.clone();
+    cancel.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || -> Result<dupes::DupReport, String> {
+        let rs: Vec<PathBuf> = roots
+            .iter()
+            .map(|r| PathBuf::from(r.trim().trim_matches('"')))
+            .filter(|r| r.is_dir())
+            .collect();
+        if rs.is_empty() {
+            return Err("None of the folders exist. Check the paths.".into());
+        }
+        let min = (min_mb.max(0.1) * 1_048_576.0) as u64;
+        let (ctx, found) = dupes::make_ctx(cancel, min);
+        let ctx = Arc::new(ctx);
+        let _g = progress(&app, "Comparing files (size, then content hash)", ctx.clone());
+        Ok(dupes::find(&rs, &ctx, &found))
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn delete_duplicates(state: State<'_, AppState>, groups: Vec<dupes::DupSel>, mode: String) -> Result<quarantine::Report, String> {
+    if mode != "quarantine" && mode != "permanent" {
+        return Err("Unknown mode".into());
+    }
+    let protected = state.settings.lock().unwrap().protected.clone();
+    let cancel = state.cancel.clone();
+    cancel.store(false, Ordering::Relaxed);
+    tauri::async_runtime::spawn_blocking(move || {
+        // content is compared again right now, so a file edited since the scan is never removed
+        let (verified, mut failed) = dupes::verify(&groups, &cancel);
+        let mut allowed = Vec::new();
+        for p in verified {
+            match safety::check_deletable(Path::new(&p), &protected) {
+                Ok(()) => allowed.push(p),
+                Err(reason) => failed.push(quarantine::Fail { path: p, reason }),
+            }
+        }
+        let mut rep = quarantine::remove(&allowed, &mode, cancel);
+        log_history(if mode == "permanent" { "delete" } else { "quarantine" }, &format!("{} duplicate file(s)", rep.ok), rep.bytes);
+        snapshot();
+        rep.failed.extend(failed);
+        rep
+    })
+    .await
+    .map_err(join_err)
+}
+
+// ------------------------------------------------------------ startup
+
+#[tauri::command]
+async fn list_startup() -> Vec<startup::StartItem> {
+    tauri::async_runtime::spawn_blocking(startup::list).await.unwrap_or_default()
+}
+
+#[tauri::command]
+async fn set_startup(id: String, enable: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = startup::set(&id, enable, is_admin())?;
+        log_history("startup", &format!("{} {}", if enable { "enabled" } else { "disabled" }, name), 0);
+        Ok(name)
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn ai_explain_startup(state: State<'_, AppState>, name: String, command: String, kind: String, model: String, lang: String) -> Result<Value, String> {
+    let (host, think) = {
+        let st = state.settings.lock().unwrap();
+        (st.ollama_host.clone(), st.think.get(&model).copied().unwrap_or(false))
+    };
+    tauri::async_runtime::spawn_blocking(move || ai::explain_startup(&host, &model, &lang, &name, &command, &kind, think))
+        .await
+        .map_err(join_err)?
+}
+
+// ------------------------------------------------------------ health
+
+#[tauri::command]
+async fn health_check() -> Result<health::Report, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let d = drive_info(&sys_drive());
+        health::check(d.as_ref().map(|x| x.free).unwrap_or(0), d.as_ref().map(|x| x.total).unwrap_or(0))
+    })
+    .await
+    .map_err(join_err)
+}
+
+// ------------------------------------------------------------ troubleshoot
+
+#[tauri::command]
+fn list_fixes() -> Vec<fixes::FixDef> {
+    fixes::defs()
+}
+
+#[tauri::command]
+fn run_fix(app: AppHandle, state: State<'_, AppState>, id: String, req_id: String) -> Result<(), String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.fix_cancels.lock().unwrap().insert(req_id.clone(), cancel.clone());
+    fixes::run(app, id, req_id, is_admin(), cancel)
+}
+
+#[tauri::command]
+fn cancel_fix(state: State<'_, AppState>, req_id: String) {
+    if let Some(c) = state.fix_cancels.lock().unwrap().get(&req_id) {
+        c.store(true, Ordering::Relaxed);
+    }
+}
+
+
+// ------------------------------------------------------------ phase 2: optimize, apps, updates
+
+#[tauri::command]
+async fn list_tweaks() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(tweaks::list).await.map_err(join_err)
+}
+
+#[tauri::command]
+async fn set_tweak(id: String, on: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || tweaks::set(&id, on, is_admin())).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn list_power_plans() -> Result<Vec<Value>, String> {
+    tauri::async_runtime::spawn_blocking(tweaks::power_plans).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn set_power_plan(guid: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || tweaks::set_power_plan(&guid)).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn list_installed() -> Result<Vec<apps::App>, String> {
+    tauri::async_runtime::spawn_blocking(apps::list_installed).await.map_err(join_err)
+}
+
+#[tauri::command]
+fn uninstall_app(app: AppHandle, id: String, quiet: bool) -> Result<String, String> {
+    apps::uninstall(app, &id, quiet)
+}
+
+#[tauri::command]
+async fn list_bloat() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(apps::list_bloat).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn list_updates() -> Result<updater::Listing, String> {
+    tauri::async_runtime::spawn_blocking(updater::list).await.map_err(join_err)?
+}
+
+
+// ------------------------------------------------------------ phase 3: monitor, privacy, schedule, diagnostics
+
+#[tauri::command]
+async fn list_processes() -> Result<Vec<procs::Proc>, String> {
+    tauri::async_runtime::spawn_blocking(procs::list).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn end_process(pid: u32, name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || procs::end(pid, &name)).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn list_browser_data() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| json!({"items": browsers::list(), "running": browsers::running()})).await.map_err(join_err)
+}
+
+#[tauri::command]
+async fn clean_browser(state: State<'_, AppState>, paths: Vec<String>) -> Result<quarantine::Report, String> {
+    let protected = state.settings.lock().unwrap().protected.clone();
+    let cancel = state.cancel.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let running = browsers::running();
+        let cands = browsers::list();
+        let mut allowed: Vec<String> = Vec::new();
+        let mut rep_fail: Vec<quarantine::Fail> = Vec::new();
+        for p in paths {
+            match cands.iter().find(|c| c.path.eq_ignore_ascii_case(&p)) {
+                None => rep_fail.push(quarantine::Fail { path: p, reason: "Not a recognised browser privacy file".into() }),
+                Some(c) if running.contains(&c.browser) => rep_fail.push(quarantine::Fail { path: p, reason: format!("{} is open. Close it first.", c.browser) }),
+                Some(_) => match safety::check_deletable(Path::new(&p), &protected) {
+                    Ok(()) => allowed.push(p),
+                    Err(r) => rep_fail.push(quarantine::Fail { path: p, reason: r }),
+                },
+            }
+        }
+        let mut rep = quarantine::remove(&allowed, "quarantine", cancel);
+        log_history("browser-privacy", &format!("{} file(s) moved to Quarantine", rep.ok), rep.bytes);
+        rep.failed.extend(rep_fail);
+        rep
+    })
+    .await
+    .map_err(join_err)
+}
+
+#[tauri::command]
+async fn list_event_groups(days: u32) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || diag::groups(days)).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn schedule_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(schedule::status).await.map_err(join_err)?
+}
+
+#[tauri::command]
+fn schedule_choices() -> Vec<Value> {
+    schedule::choices()
+}
+
+#[tauri::command]
+async fn schedule_set(freq: String, day: String, time: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || schedule::set(&freq, &day, &time)).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn schedule_remove() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(schedule::remove).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn schedule_run_now() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(schedule::auto_clean).await.map_err(join_err)
+}
+
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+// ------------------------------------------------------------ recover
+
+#[tauri::command]
+async fn recycle_list() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(recover::bin_list).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn recycle_restore(paths: Vec<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let r = recover::bin_restore(paths)?;
+        log_history("restore", &format!("{} item(s) from the Recycle Bin", r["restored"]), 0);
+        Ok(r)
+    })
+    .await
+    .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn shadow_list() -> Result<Vec<recover::Shadow>, String> {
+    tauri::async_runtime::spawn_blocking(|| recover::shadows(is_admin())).await.map_err(join_err)?
+}
+
+#[tauri::command]
+async fn shadow_browse(device: String, path: String) -> Result<Vec<recover::ShadowEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || recover::shadow_browse(&device, &path, is_admin()))
+        .await
+        .map_err(join_err)?
+}
+
+#[tauri::command]
+async fn shadow_restore(device: String, paths: Vec<String>, dest: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || recover::shadow_restore(&device, &paths, &dest, is_admin()))
+        .await
+        .map_err(join_err)?
+}
+
 // ------------------------------------------------------------ main
 
 fn main() {
+    if std::env::args().any(|a| a == "--auto-clean") {
+        schedule::auto_clean();
+        return;
+    }
     let settings = load_settings();
     let state = AppState {
         cancel: Arc::new(AtomicBool::new(false)),
@@ -675,6 +972,7 @@ fn main() {
         folder: Arc::new(Mutex::new(None)),
         settings: Arc::new(Mutex::new(settings.clone())),
         ai_cancels: Arc::new(Mutex::new(HashMap::new())),
+        fix_cancels: Arc::new(Mutex::new(HashMap::new())),
     };
     let days = settings.quarantine_days;
     thread::spawn(move || {
@@ -689,6 +987,40 @@ fn main() {
 
     tauri::Builder::default()
         .manage(state)
+        .setup(|app| {
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+            let open = MenuItem::with_id(app, "open", "Open System Care Suite", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let mut b = TrayIconBuilder::new()
+                .menu(&menu)
+                .tooltip("System Care Suite")
+                .on_menu_event(|app, e| match e.id.as_ref() {
+                    "open" => show_main(app),
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, ev| {
+                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = ev {
+                        show_main(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                b = b.icon(icon.clone());
+            }
+            b.build(app)?;
+            Ok(())
+        })
+        .on_window_event(|w, ev| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = ev {
+                let keep = w.state::<AppState>().settings.lock().unwrap().close_to_tray;
+                if keep {
+                    api.prevent_close();
+                    let _ = w.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,
@@ -717,7 +1049,39 @@ fn main() {
             ai_cancel,
             ai_explain,
             ai_search,
+            find_duplicates,
+            delete_duplicates,
+            list_startup,
+            set_startup,
+            ai_explain_startup,
+            health_check,
+            list_fixes,
+            run_fix,
+            cancel_fix,
+            recycle_list,
+            recycle_restore,
+            shadow_list,
+            shadow_browse,
+            shadow_restore,
+            list_tweaks,
+            set_tweak,
+            list_power_plans,
+            set_power_plan,
+            list_installed,
+            uninstall_app,
+            list_bloat,
+            list_updates,
+            list_processes,
+            end_process,
+            list_browser_data,
+            clean_browser,
+            list_event_groups,
+            schedule_status,
+            schedule_choices,
+            schedule_set,
+            schedule_remove,
+            schedule_run_now,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Clean My System");
+        .expect("error while running System Care Suite");
 }

@@ -192,6 +192,22 @@ Write the text fields in {}.",
     Ok(v)
 }
 
+pub fn explain_startup(host: &str, model: &str, lang: &str, name: &str, command: &str, kind: &str, think: bool) -> Result<Value, String> {
+    let system = format!(
+        "You help a Windows user decide which startup items to disable. Reply with ONLY one JSON object: \
+{{\"what\":\"what this program, service or task most likely is\",\"impact\":\"what happens if it is disabled\",\"advice\":\"keep|disable|unknown\",\"reason\":\"one short reason\"}}. \
+Choose keep for drivers, audio, graphics and input utilities, security software, cloud-sync you may rely on, and anything that could break Windows. \
+Choose disable only for clearly optional launchers, updaters, chat and game apps. If you do not recognise it, choose unknown. Write the text fields in {}.",
+        lang_name(lang)
+    );
+    let user = format!("Name: {}\nType: {}\nCommand: {}", name, kind, command);
+    let raw = chat_once(host, model, &system, &user, true, think)?;
+    let mut v = extract_json(&raw).unwrap_or_else(|| json!({"what": strip_think(&raw), "impact": "", "advice": "unknown", "reason": "The model did not return structured output."}));
+    let adv = v["advice"].as_str().unwrap_or("unknown").to_lowercase();
+    v["advice"] = json!(if ["keep", "disable", "unknown"].contains(&adv.as_str()) { adv } else { "unknown".into() });
+    Ok(v)
+}
+
 pub fn nl_to_filter(host: &str, model: &str, query: &str, think: bool) -> Result<Value, String> {
     let system = "Convert the user's request about finding files on a Windows PC into a search filter. \
 Reply with ONLY one JSON object: {\"name_contains\":[strings],\"extensions\":[\".mp4\",...],\"min_mb\":number,\"older_than_days\":number,\"summary\":\"one short line in English restating the search\"}. \
@@ -202,7 +218,7 @@ Use [] for unknown lists and 0 for unknown numbers. Understand Bengali and Engli
 
 pub fn chat_system(lang: &str, ctx: &str) -> String {
     format!(
-        "You are the assistant inside Clean My System, a Windows disk-space tool, running locally through Ollama for a software developer.\n\
+        "You are the assistant inside System Care Suite, a Windows system-care tool (disk cleaning, startup, health, repair), running locally through Ollama for a software developer.\n\
 Rules:\n\
 - You can only advise. You cannot delete, move or run anything; the user does that with the app's buttons.\n\
 - Prefer the app's Safe Clean for caches and temp files, and Quarantine (undo possible) for personal files.\n\

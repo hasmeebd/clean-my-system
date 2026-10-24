@@ -1,15 +1,15 @@
-# Clean My System
+# System Care Suite
 R&D by OOFFOO · Developed by HB Mostafa
 
 Disk analyzer + safe cleaner + local Ollama assistant (Tauri 2, Rust).
 
-Windows only. See [Build from source](#build-from-source) below.
+Run: `dist\System-Care-Suite.exe`. Rebuild: double-click `Build-And-Run.bat` (needs Rust MSVC + VS Build Tools).
 
 Safety:
 - Safe Clean only touches a hard-coded allowlist of caches/temp.
 - Ollama only explains and suggests; it never deletes. AI suggestions need preview + confirm.
 - Deletes go to Quarantine (undo, auto-purge after 7 days) unless you choose permanent.
-- System paths are always protected; add your own folders under Settings -> protected paths.
+- System paths and `Desktop\Arian` are protected (Settings -> protected paths).
 - Admin-only items (Windows Temp, update cache) need "Restart as Administrator".
 
 Notes: sizes are size on disk; hard-linked files can make totals slightly exceed used space.
@@ -26,33 +26,18 @@ Rust `target` can be trimmed to just `target\debug`.
 Models that support thinking are detected from Ollama (marked with a brain). Thinking is off by default (faster); switch it on per model on
 the AI Assistant page or in Settings.
 
-## Requirements
-- Windows 10/11 (WebView2 runtime, already included in Windows 11)
-- Rust 1.98.0, MSVC toolchain (`stable-x86_64-pc-windows-msvc`); pinned in `rust-toolchain.toml`
-- Visual Studio Build Tools (C++ workload)
-- Optional: [Ollama](https://ollama.com) running locally (default `http://127.0.0.1:11434`) for the AI assistant. Default model is `qwen3:8b`; no models are bundled.
+## System Care Suite - Phase 1 tools
 
-## Build from source
-```powershell
-git clone https://github.com/hasmeebd/clean-my-system.git
-cd clean-my-system\src-tauri
-cargo build --release --locked
-# result: target\release\cdrive-studio.exe
-```
-Convenience script: `Build-And-Run.bat` (runs `build.ps1`, which stops any running copy of the app, builds into `%USERPROFILE%\.cargo-targets\cdrive-studio`, and copies the exe to `dist\Clean-My-System.exe`).
+- **System Health**: score from 8 transparent checks (space, disk health, TRIM, startup load, uptime, pending restart, RAM, antivirus). Drive TRIM / analyze / defrag (HDD only).
+- **Duplicates**: size -> quick fingerprint -> full BLAKE3. Each removal is re-verified against the kept copy; at least one copy always stays. Goes to Quarantine by default.
+- **Startup**: same on/off switch as Task Manager (registry, Startup folders, logon tasks, third-party services). Reversible; AI only explains.
+- **Troubleshoot**: fixed list of built-in repairs (sfc, DISM, chkdsk scan, network reset, Windows Update reset, ...) with live output and cancel.
+- **Recover Files**: Recycle Bin restore; Previous Versions (shadow copies, Administrator) copied out without overwriting.
 
-## Project layout
-| Path | Purpose |
-|---|---|
-| `src-tauri/` | Rust backend (Tauri 2): scanning, safety rules, quarantine, Ollama client |
-| `ui/` | Static frontend (plain HTML/CSS/JS, no npm build step) |
-| `build.ps1`, `Build-And-Run.bat` | Windows build helpers |
+Not included on purpose: registry cleaner, RAM booster, own antivirus.
 
-## Assets, Models and External Dependencies (not in repo)
-See [ASSETS.md](ASSETS.md). Short version: no models, no binaries, no secrets. The app needs no API keys or `.env` file.
+## Phase 2 tools
 
-## Contributing
-Issues and pull requests are welcome. Please keep the safety rules intact: the app must never delete anything outside its allowlist without preview and confirmation.
-
-## License
-[MIT](LICENSE) (c) 2026 OOFFOO (HB Mostafa)
+- **Optimize**: reversible registry tweaks (originals are saved and put back on undo), power plan switch, hibernation off (frees hiberfil.sys), one-click restore point, and Store-app debloat from a fixed allowlist (reinstallable from the Store). No speed-boost claims.
+- **Programs**: installed-program list with each program's own uninstaller (silent mode when the program offers it).
+- **Updates**: winget upgrade list; update selected or all, with live output.

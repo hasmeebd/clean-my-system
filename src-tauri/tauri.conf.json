@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Clean My System",
+  "productName": "System Care Suite",
   "version": "0.1.0",
   "identifier": "com.ooffoo.cdrivestudio",
   "build": {
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Clean My System — R&D by OOFFOO · Developed by HB Mostafa",
+        "title": "System Care Suite — R&D by OOFFOO · Developed by HB Mostafa",
         "width": 1320,
         "height": 840,
         "minWidth": 1020,

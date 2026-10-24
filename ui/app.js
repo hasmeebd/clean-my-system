@@ -1,8 +1,8 @@
 'use strict';
-/* Clean My System frontend. Plain JS, no bundler. Talks to the Rust backend through Tauri invoke. */
+/* System Care Suite frontend. Plain JS, no bundler. Talks to the Rust backend through Tauri invoke. */
 
 if (!window.__TAURI__) {
-  document.body.innerHTML = '<div style="padding:40px;font-family:Segoe UI">This page must run inside the Clean My System app.</div>';
+  document.body.innerHTML = '<div style="padding:40px;font-family:Segoe UI">This page must run inside the System Care Suite app.</div>';
   throw new Error('No Tauri runtime');
 }
 const TAURI = window.__TAURI__;
@@ -30,6 +30,7 @@ const S = {
   folder: null, folderSel: new Set(), pendingPath: null, tmRects: [],
   large: null, largeSel: new Set(), largeRoot: 'C:\\', largeMin: 500,
   junk: null, junkSel: new Set(), junkRoots: null, junkIgnored: true, junkStack: new Set(), junkCollapsed: new Set(), junkRisk: 'all',
+  dup: null, dupSel: new Set(), dupRoots: null, dupMin: 1, dupShown: 100, health: null, startup: null, startFilter: 'run', rcTab: 'bin', bin: [], binSel: new Set(), shPath: '',
   chat: [], aiReq: null, search: null, searchSel: new Set(),
 };
 const VIEWS = {};
@@ -81,7 +82,7 @@ function modal({ title, body, buttons, onOpen }) {
       const el = document.createElement('button');
       el.className = 'btn ' + (b.cls || '');
       el.textContent = b.label;
-      el.onclick = () => close(b.value);
+      el.onclick = () => (b.keep ? (b.onClick && b.onClick(el)) : close(b.value));
       foot.append(el);
     });
     if (onOpen) onOpen(root);
@@ -94,8 +95,9 @@ const failList = f => f && f.length
 // ------------------------------------------------------------------ chrome: nav, drive bar, badges
 
 const PAGES = [
-  ['dashboard', 'Dashboard', '◧'], ['clean', 'Safe Clean', '✦'], ['explorer', 'Explorer', '▦'],
-  ['large', 'Large Files', '⬢'], ['junk', 'Dev Junk', '⌬'], ['ai', 'AI Assistant', '✺'],
+  ['dashboard', 'Dashboard', '◧'], ['health', 'System Health', '♥'], ['clean', 'Safe Clean', '✦'], ['explorer', 'Explorer', '▦'],
+  ['large', 'Large Files', '⬢'], ['dupes', 'Duplicates', '⧉'], ['junk', 'Dev Junk', '⌬'], ['startup', 'Startup', '⏻'], ['optimize', 'Optimize', '⚡'], ['apps', 'Programs', '▤'], ['updates', 'Updates', '⇪'], ['procs', 'Processes', '▥'], ['browsers', 'Browser Privacy', '◍'], ['schedule', 'Schedule', '◷'], ['diag', 'Diagnostics', '✱'],
+  ['fix', 'Troubleshoot', '✚'], ['recover', 'Recover Files', '↺'], ['ai', 'AI Assistant', '✺'],
   ['quarantine', 'Quarantine & History', '⟲'], ['settings', 'Settings', '⚙'],
 ];
 function buildNav() {
@@ -177,7 +179,7 @@ async function deleteFlow(items, kind, opts) {
   });
   if (!r.value) return false;
   if (r.data.mode === 'permanent' && !r.data.ack) { toast('Tick the confirmation to delete permanently.', true); return false; }
-  const rep = await busy('Removing', () => invoke('delete_paths', { paths: items.map(i => i.path), mode: r.data.mode, kind: kind || null }))
+  const rep = await busy('Removing', () => (opts.remove ? opts.remove(r.data.mode) : invoke('delete_paths', { paths: items.map(i => i.path), mode: r.data.mode, kind: kind || null })))
     .catch(e => { toast(String(e), true); return null; });
   if (!rep) return false;
   await alertBox(rep.ok ? 'Done' : 'Nothing was removed',
@@ -237,6 +239,15 @@ VIEWS.dashboard = async () => {
       </div>
     </div>`;
   bindAdmin();
+  v.insertAdjacentHTML('beforeend', '<div class="card" id="dbHealth" style="margin-top:14px"><div class="muted">Checking system health…</div></div>');
+  invoke('health_check').then(r => {
+    const el = $('#dbHealth'); if (!el || S.page !== 'dashboard') return;
+    const issues = r.checks.filter(c => c.status === 'bad' || c.status === 'warn');
+    el.innerHTML = `<div class="row" style="gap:22px">${scoreRing(r.score, r.grade)}<div style="flex:1;min-width:240px"><h3>System health</h3>
+      ${issues.length ? issues.slice(0, 4).map(c => `<div style="margin:4px 0"><i class="dotc" style="background:${STATUS_COL[c.status]}"></i> <b>${esc(c.title)}</b> <span class="muted">${esc(c.detail)}</span></div>`).join('') : '<div class="muted">No problems found.</div>'}</div>
+      <button class="btn primary" id="dbHealthGo">Open System Health</button></div>`;
+    $('#dbHealthGo').onclick = () => go('health');
+  }).catch(() => { const el = $('#dbHealth'); if (el) el.remove(); });
   $('#dbClean').onclick = () => { go('clean'); setTimeout(scanHogs, 50); };
   $('#dbEx').onclick = () => { S.pendingPath = S.drive.letter + '\\'; go('explorer'); };
   $('#dbLarge').onclick = () => go('large');
@@ -685,6 +696,673 @@ VIEWS.junk = async () => {
   renderJunk();
 };
 
+// ------------------------------------------------------------------ shared: live repair runner
+
+const READONLY_FIX = new Set(['net_info', 'recent_errors', 'dism_check', 'dism_scan', 'chkdsk_scan']);
+const EXPLAINABLE = new Set(['net_info', 'recent_errors', 'sfc', 'dism_check', 'dism_scan', 'dism_restore', 'chkdsk_scan']);
+
+async function runFixUI(id, title, explainable) {
+  const reqId = 'f' + Date.now();
+  const lines = [];
+  let logEl = null, stateEl = null, stopEl = null, aiEl = null, finished = false, doneInfo = null;
+  const paint = () => {
+    if (logEl) { logEl.textContent = lines.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
+    if (!stateEl) return;
+    if (!finished) { stateEl.textContent = 'Running… keep this window open.'; return; }
+    const d = doneInfo || {};
+    stateEl.textContent = d.cancelled ? 'Stopped.' : d.error ? 'Could not run: ' + d.error : `Finished (exit code ${d.code}).` + (d.reboot ? ' Restart Windows to finish.' : '');
+    if (stopEl) stopEl.classList.add('hidden');
+    if (aiEl && explainable && lines.length) aiEl.classList.remove('hidden');
+  };
+  const u1 = await listen('fix-line', e => { if (e.payload.id === reqId) { lines.push(e.payload.line); if (lines.length > 4000) lines.shift(); paint(); } });
+  const u2 = await listen('fix-done', e => { if (e.payload.id === reqId) { finished = true; doneInfo = e.payload; paint(); refreshDrive(); } });
+  const mp = modal({
+    title: esc(title),
+    body: '<div class="muted" id="fxState">Starting…</div><pre class="term" id="fxLog"></pre>',
+    buttons: [
+      { label: 'Stop', value: 'stop', cls: 'danger', keep: true, onClick: () => { invoke('cancel_fix', { reqId }); } },
+      { label: 'Explain with AI', value: 'ai', cls: 'hidden-ai' },
+      { label: 'Close', value: 'close', cls: 'primary' },
+    ],
+    onOpen: root => {
+      logEl = $('#fxLog', root); stateEl = $('#fxState', root);
+      const bs = $$('.mfoot button', root);
+      stopEl = bs[0]; aiEl = bs[1]; aiEl.classList.add('hidden');
+      paint();
+    },
+  });
+  try { await invoke('run_fix', { id, reqId }); }
+  catch (e) { finished = true; doneInfo = { error: String(e) }; paint(); }
+  const r = await mp;
+  u1(); u2();
+  if (r.value === 'ai') {
+    const text = lines.slice(-70).join('\n').slice(-6000);
+    go('ai');
+    setTimeout(() => sendChat(`I ran "${title}" on my Windows PC. Explain this output in plain language, tell me if anything is wrong, and what I should do next:\n\n${text}`), 150);
+  }
+}
+
+// ------------------------------------------------------------------ System Health
+
+const STATUS_COL = { ok: '#22c55e', warn: '#f59e0b', bad: '#ef4444', unknown: '#64748b' };
+const fdur = s => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600); return d ? `${d}d ${h}h` : `${h}h ${Math.floor(s % 3600 / 60)}m`; };
+
+function scoreRing(score, grade) {
+  const col = score >= 90 ? '#22c55e' : score >= 75 ? '#2dd4bf' : score >= 55 ? '#f59e0b' : '#ef4444';
+  return `<div class="ring" style="--p:${score};--c:${col}"><div><b>${score}</b><small>${esc(grade)}</small></div></div>`;
+}
+
+async function loadHealth() { S.health = await invoke('health_check'); return S.health; }
+
+VIEWS.health = async () => {
+  $('#view').innerHTML = '<h2>System Health</h2><div class="sub">Every point in the score comes from a check below. Nothing is guessed.</div><div class="empty">Checking disks, memory, security and startup…</div>';
+  const r = await busy('Checking your PC', loadHealth).catch(e => { toast(String(e), true); return null; });
+  if (!r || S.page !== 'health') return;
+  await refreshBadges();
+  const vols = (r.volumes || []).filter(v => v.type === 'Fixed' && v.fs);
+  $('#view').innerHTML = `<h2>System Health</h2><div class="sub">Every point in the score comes from a check below. Nothing is guessed.</div>${adminBanner()}
+    <div class="grid g2">
+      <div class="card row" style="gap:22px">${scoreRing(r.score, r.grade)}
+        <div><div class="lbl">PC health score</div><div class="muted">${r.checks.filter(c => c.status === 'bad').length} problem(s) · ${r.checks.filter(c => c.status === 'warn').length} warning(s)</div>
+          <div class="kv" style="margin-top:10px"><div>Memory</div><div>${fmt(r.ram_used)} of ${fmt(r.ram_total)}</div><div>CPU threads</div><div>${r.cpu_threads}</div><div>Uptime</div><div>${fdur(r.uptime_s)}</div><div>Startup items</div><div>${r.startup_enabled} enabled</div></div></div></div>
+      <div class="card"><h3>Physical disks</h3>${(r.disks || []).length ? r.disks.map(d => `<div style="margin:8px 0"><b>${esc(d.name)}</b> <span class="tag ${d.health === 'Healthy' ? 'safe' : 'keep'}">${esc(d.health || '?')}</span> <span class="tag info">${esc(d.media)} · ${esc(d.bus)}</span>
+        <div class="muted">${fmt(d.size)}${d.temp != null ? ' · ' + d.temp + ' °C' : ''}${d.wear != null ? ' · wear ' + d.wear + '%' : ''}${d.hours != null ? ' · ' + num(d.hours) + ' h powered on' : ''}${d.readErr || d.writeErr ? ' · errors logged' : ''}</div></div>`).join('') : '<div class="muted">Windows returned no disk data. Some counters need Administrator rights.</div>'}</div>
+    </div>
+    <h3 style="margin-top:18px">Checks</h3>
+    <table><thead><tr><th style="width:26px"></th><th>Check</th><th>Result</th><th class="num">Points</th><th></th></tr></thead><tbody>
+    ${r.checks.map(c => `<tr><td><i class="dotc" style="background:${STATUS_COL[c.status]}"></i></td><td><b>${esc(c.title)}</b></td><td class="muted">${esc(c.detail)}</td><td class="num">${c.max ? c.points + ' / ' + c.max : '–'}</td>
+      <td class="num">${c.action && c.status !== 'ok' ? `<button class="btn sm" data-go="${esc(c.action)}">${c.action === 'startup' ? 'Open Startup' : c.action === 'clean' ? 'Open Safe Clean' : 'Details below'}</button>` : ''}</td></tr>`).join('')}</tbody></table>
+    <h3 style="margin-top:22px">Drives</h3>
+    <div class="muted" style="margin-bottom:8px">SSDs are kept healthy with TRIM, hard disks with defragmentation. Never defragment an SSD.${S.admin ? '' : ' These actions need Administrator rights.'}</div>
+    <table><thead><tr><th>Drive</th><th>Type</th><th class="num">Free</th><th>Maintenance</th></tr></thead><tbody>
+    ${vols.map(v => `<tr><td><b>${esc(v.letter)}:</b> <span class="muted">${esc(v.label || '')} ${esc(v.fs)}</span></td><td><span class="tag ${v.media === 'SSD' ? 'safe' : v.media === 'HDD' ? 'review' : 'info'}">${esc(v.media)}</span></td>
+      <td class="num">${fmt(v.free)} <span class="muted">/ ${fmt(v.size)}</span></td>
+      <td>${v.media === 'SSD' ? `<button class="btn sm" data-fx="trim:${esc(v.letter)}">TRIM</button> ` : ''}<button class="btn sm" data-fx="analyze:${esc(v.letter)}">Analyze</button>${v.media === 'HDD' ? ` <button class="btn sm" data-fx="defrag:${esc(v.letter)}">Defragment…</button>` : ''}</td></tr>`).join('')}</tbody></table>`;
+  bindAdmin();
+  $$('[data-go]').forEach(b => b.onclick = () => { if (b.dataset.go === 'health') $('#view').scrollTop = 99999; else go(b.dataset.go); });
+  $$('[data-fx]').forEach(b => b.onclick = async () => {
+    const id = b.dataset.fx;
+    if (id.startsWith('defrag:')) {
+      const c = await modal({ title: 'Defragment this drive?', body: 'This rearranges files on a hard disk and can run for hours. The PC stays usable but slower. Do not run it on an SSD.', buttons: [{ label: 'Cancel', value: false }, { label: 'Start', value: true, cls: 'primary' }] });
+      if (!c.value) return;
+    }
+    runFixUI(id, b.textContent.trim() + ' · drive ' + id.split(':')[1]);
+  });
+};
+
+// ------------------------------------------------------------------ Troubleshoot
+
+VIEWS.fix = async () => {
+  const defs = await invoke('list_fixes');
+  await refreshBadges();
+  const groups = [...new Set(defs.map(d => d.group))];
+  $('#view').innerHTML = `<h2>Troubleshoot</h2><div class="sub">Well-known Windows repair commands, each explained, with live output. Only these built-in actions can run. After a run, <b>Explain with AI</b> turns the output into plain language.</div>${adminBanner()}
+    ${groups.map(g => `<h3 style="margin:18px 0 8px">${esc(g)}</h3><div class="grid g2">${defs.filter(d => d.group === g).map(d => `<div class="card"><div class="row"><b>${esc(d.title)}</b><span class="spacer"></span>
+      ${d.admin ? '<span class="tag review">Administrator</span>' : ''}${d.long ? '<span class="tag info">takes a while</span>' : ''}${d.reboot ? '<span class="tag info">needs restart</span>' : ''}${d.caution ? '<span class="tag keep">brief disruption</span>' : ''}</div>
+      <div class="muted" style="margin:6px 0 10px">${esc(d.desc)}</div><button class="btn ${READONLY_FIX.has(d.id) ? '' : 'primary'}" data-run="${esc(d.id)}">Run</button></div>`).join('')}</div>`).join('')}`;
+  bindAdmin();
+  $$('[data-run]').forEach(b => b.onclick = async () => {
+    const d = defs.find(x => x.id === b.dataset.run);
+    if (d.admin && !S.admin) { toast('This needs Administrator rights. Use Restart as Administrator.', true); return; }
+    if (!READONLY_FIX.has(d.id)) {
+      const c = await modal({ title: esc(d.title) + '?', body: `<div>${esc(d.desc)}</div>${d.caution ? '<div class="banner warn" style="margin-top:10px"><span>Your screen or connection may flicker for a moment. Save your work first.</span></div>' : ''}${d.reboot ? '<div class="muted" style="margin-top:10px">A restart is needed afterwards.</div>' : ''}`, buttons: [{ label: 'Cancel', value: false }, { label: 'Run', value: true, cls: 'primary' }] });
+      if (!c.value) return;
+    }
+    runFixUI(d.id, d.title, EXPLAINABLE.has(d.id));
+  });
+};
+
+// ------------------------------------------------------------------ Startup
+
+const KIND_LBL = { run: 'Registry', folder: 'Startup folder', task: 'Scheduled tasks', service: 'Services' };
+VIEWS.startup = async () => {
+  $('#view').innerHTML = '<h2>Startup</h2><div class="sub">Loading startup entries…</div>';
+  const items = S.startup = await busy('Reading startup entries', () => invoke('list_startup')).catch(e => { toast(String(e), true); return []; });
+  await refreshBadges();
+  if (S.page !== 'startup') return;
+  S.startFilter = S.startFilter || 'run';
+  const draw = () => {
+    const q = ($('#stQ') || {}).value || '';
+    const vis = items.filter(i => (S.startFilter === 'all' || i.kind === S.startFilter) && (!q || (i.name + ' ' + i.command).toLowerCase().includes(q.toLowerCase())));
+    const apps = items.filter(i => i.kind !== 'service');
+    $('#stBody').innerHTML = `<table><thead><tr><th style="width:56px">On</th><th>Item</th><th>Where</th><th></th></tr></thead><tbody>
+      ${vis.map(i => `<tr><td><label class="switch"><input type="checkbox" data-id="${esc(i.id)}" ${i.enabled ? 'checked' : ''}><i></i></label></td>
+        <td><b>${esc(i.name)}</b> ${i.exists ? '' : '<span class="tag keep" title="The program this entry starts no longer exists">file missing</span>'}
+          <div class="muted path"><code>${esc(i.command)}</code></div>${i.detail ? `<div class="muted">${esc(i.detail)}</div>` : ''}</td>
+        <td class="muted">${esc(i.source)}${i.needs_admin && !S.admin ? ' <span class="tag review">needs Administrator</span>' : ''}</td>
+        <td class="num"><button class="btn sm" data-ai="${esc(i.id)}">AI: explain</button></td></tr>`).join('') || '<tr><td colspan="4" class="empty">Nothing here.</td></tr>'}</tbody></table>`;
+    $$('#stBody input[data-id]').forEach(c => c.onchange = async () => {
+      const it = items.find(x => x.id === c.dataset.id);
+      if (it.kind === 'service' && !c.checked && /security/.test(it.detail)) {
+        const ok = await modal({ title: 'Disable a security service?', body: 'This looks like security software. Disabling it leaves the PC less protected.', buttons: [{ label: 'Cancel', value: false }, { label: 'Disable anyway', value: true, cls: 'danger' }] });
+        if (!ok.value) { c.checked = true; return; }
+      }
+      c.disabled = true;
+      try { await invoke('set_startup', { id: it.id, enable: c.checked }); it.enabled = c.checked; toast(`${it.name}: ${c.checked ? 'enabled' : 'disabled'}. Takes effect at the next sign-in.`); }
+      catch (e) { c.checked = !c.checked; toast(String(e), true); }
+      c.disabled = false; head();
+    });
+    $$('#stBody [data-ai]').forEach(b => b.onclick = async () => {
+      if (!S.ollama.running) { toast('Ollama is not running.', true); return; }
+      const it = items.find(x => x.id === b.dataset.ai);
+      try {
+        const r = await busy('Asking ' + S.settings.model, () => invoke('ai_explain_startup', { name: it.name, command: it.command, kind: it.source, model: S.settings.model, lang: S.settings.lang }));
+        await modal({ title: `${esc(it.name)} <span class="tag ai">AI suggestion · verify first</span>`, body: `<div class="kv"><div>What it is</div><div>${esc(r.what)}</div><div>If disabled</div><div>${esc(r.impact)}</div><div>Suggestion</div><div><span class="tag ${r.advice === 'disable' ? 'review' : r.advice === 'keep' ? 'safe' : 'info'}">${esc(r.advice)}</span> ${esc(r.reason)}</div></div>`, buttons: [{ label: 'Close', value: true, cls: 'primary' }] });
+      } catch (e) { toast(String(e), true); }
+    });
+  };
+  const head = () => {
+    const apps = items.filter(i => i.kind !== 'service');
+    $('#stHead').innerHTML = `<div class="grid g4">
+      <div class="card"><div class="lbl">Enabled at sign-in</div><div class="big">${apps.filter(i => i.enabled).length}</div><div class="muted">registry, folders, tasks</div></div>
+      <div class="card"><div class="lbl">Disabled by you</div><div class="big">${apps.filter(i => !i.enabled).length}</div><div class="muted">switch back on any time</div></div>
+      <div class="card"><div class="lbl">Broken entries</div><div class="big">${items.filter(i => !i.exists).length}</div><div class="muted">point to a missing program</div></div>
+      <div class="card"><div class="lbl">Third-party services</div><div class="big">${items.filter(i => i.kind === 'service' && i.enabled).length}</div><div class="muted">set to start automatically</div></div></div>`;
+  };
+  $('#view').innerHTML = `<h2>Startup</h2><div class="sub">Programs that launch with Windows slow every boot. Switching one off does not uninstall it and is reversible. It uses the same switch as Task Manager. ${S.admin ? '' : 'All-users entries and services need Administrator rights.'}</div>${adminBanner()}
+    <div id="stHead"></div>
+    <div class="row" style="margin:14px 0 8px"><div class="chips">${['run', 'folder', 'task', 'service', 'all'].map(k => `<span class="chip ${S.startFilter === k ? 'on' : ''}" data-k="${k}">${k === 'all' ? 'All' : KIND_LBL[k]} · ${k === 'all' ? items.length : items.filter(i => i.kind === k).length}</span>`).join('')}</div><span class="spacer"></span><input type="text" id="stQ" placeholder="Filter…" style="width:220px"></div>
+    <div id="stBody"></div>`;
+  bindAdmin(); head(); draw();
+  $('#stQ').oninput = draw;
+  $$('[data-k]').forEach(c => c.onclick = () => { S.startFilter = c.dataset.k; VIEWS.startup.redraw(); });
+  VIEWS.startup.redraw = () => { $$('[data-k]').forEach(c => c.classList.toggle('on', c.dataset.k === S.startFilter)); draw(); };
+};
+
+// ------------------------------------------------------------------ Duplicates
+
+function dupSelAuto(g, how) {
+  const files = [...g.files];
+  let keep;
+  if (how === 'oldest') keep = files.reduce((a, b) => (b.modified < a.modified ? b : a));
+  else if (how === 'newest') keep = files.reduce((a, b) => (b.modified > a.modified ? b : a));
+  else keep = files.reduce((a, b) => (b.path.length < a.path.length ? b : a));
+  files.forEach(f => f.path === keep.path ? S.dupSel.delete(f.path) : S.dupSel.add(f.path));
+}
+
+function renderDupes() {
+  const box = $('#dpBody');
+  if (!box || !S.dup) return;
+  const r = S.dup;
+  if (!r.groups.length) { box.innerHTML = `<div class="empty">No identical files found among ${num(r.scanned_files)} files.</div>`; return; }
+  const shown = r.groups.slice(0, S.dupShown);
+  const sizeOf = p => { for (const g of r.groups) if (g.files.some(f => f.path === p)) return g.size; return 0; };
+  box.innerHTML = `<div class="grid g4">
+      <div class="card"><div class="lbl">Duplicate groups</div><div class="big">${num(r.groups.length)}${r.truncated ? '+' : ''}</div><div class="muted">byte-for-byte identical</div></div>
+      <div class="card"><div class="lbl">Wasted space</div><div class="big">${fmt(r.total_wasted)}</div><div class="muted">if only one copy of each stays</div></div>
+      <div class="card"><div class="lbl">Files compared</div><div class="big">${num(r.scanned_files)}</div><div class="muted">${num(r.same_size_files)} shared a size</div></div>
+      <div class="card"><div class="lbl">Selected</div><div class="big">${S.dupSel.size}</div><div class="muted">${fmt([...S.dupSel].reduce((s, p) => s + sizeOf(p), 0))}</div></div></div>
+    <div class="row" style="margin:14px 0"><span class="muted">Auto-select, keeping in every group the</span>
+      <button class="btn sm" data-auto="oldest">oldest file</button><button class="btn sm" data-auto="newest">newest file</button><button class="btn sm" data-auto="shortest">shortest path</button><button class="btn sm" data-auto="none">Clear</button></div>
+    ${shown.map((g, gi) => `<div class="card" style="margin-bottom:10px"><div class="row"><b>${fmt(g.size)}</b><span class="muted">× ${g.files.length} copies · ${fmt(g.wasted)} wasted</span></div>
+      <table><tbody>${g.files.map(f => `<tr><td style="width:30px"><input type="checkbox" data-g="${gi}" data-p="${esc(f.path)}" ${S.dupSel.has(f.path) ? 'checked' : ''}></td>
+        <td class="path"><code>${esc(f.path)}</code></td><td class="num muted">${fdate(f.modified)}</td><td class="num"><span class="lnk" data-rv="${esc(f.path)}">Show</span></td></tr>`).join('')}</tbody></table></div>`).join('')}
+    ${r.groups.length > shown.length ? `<div class="row" style="justify-content:center;margin:10px"><button class="btn" id="dpMore">Show ${Math.min(100, r.groups.length - shown.length)} more groups</button></div>` : ''}<div id="dpSel"></div>`;
+  $$('[data-auto]').forEach(b => b.onclick = () => {
+    if (b.dataset.auto === 'none') S.dupSel = new Set(); else shown.forEach(g => dupSelAuto(g, b.dataset.auto));
+    renderDupes();
+  });
+  $$('input[data-p]').forEach(c => c.onchange = () => {
+    const g = r.groups[+c.dataset.g];
+    if (c.checked) {
+      S.dupSel.add(c.dataset.p);
+      if (g.files.every(f => S.dupSel.has(f.path))) { S.dupSel.delete(c.dataset.p); toast('Keep at least one copy in every group.', true); }
+    } else S.dupSel.delete(c.dataset.p);
+    renderDupes();
+  });
+  $$('[data-rv]').forEach(a => a.onclick = () => invoke('reveal_in_explorer', { path: a.dataset.rv }));
+  const more = $('#dpMore'); if (more) more.onclick = () => { S.dupShown += 100; renderDupes(); };
+  selBar($('#dpSel'), S.dupSel, sizeOf, async () => {
+    const paths = [...S.dupSel];
+    const groups = r.groups.map(g => ({ keep: g.files.filter(f => !S.dupSel.has(f.path)).map(f => f.path), remove: g.files.filter(f => S.dupSel.has(f.path)).map(f => f.path) })).filter(g => g.remove.length);
+    const items = paths.map(p => ({ path: p, size: sizeOf(p) }));
+    const ok = await deleteFlow(items, null, {
+      extraHtml: '<div class="muted" style="margin-bottom:8px">Each file is compared with the copy that stays once more right before removal. A file that changed since the scan is skipped.</div>',
+      remove: mode => invoke('delete_duplicates', { groups, mode }),
+    });
+    if (ok) {
+      const gone = new Set(paths);
+      r.groups.forEach(g => { g.files = g.files.filter(f => !gone.has(f.path)); g.wasted = g.size * Math.max(0, g.files.length - 1); });
+      S.dup.groups = r.groups.filter(g => g.files.length > 1); S.dup.total_wasted = S.dup.groups.reduce((s, g) => s + g.wasted, 0);
+      S.dupSel = new Set(); renderDupes();
+    }
+  });
+}
+
+VIEWS.dupes = async () => {
+  const qp = await invoke('quick_paths');
+  const drives = await invoke('list_drives').catch(() => []);
+  if (!S.dupRoots) S.dupRoots = [qp[1].path, qp[2].path, qp[3].path];
+  $('#view').innerHTML = `<h2>Duplicates</h2><div class="sub">Finds files with identical content, whatever their names. Files are matched by size, then a quick fingerprint, then a full BLAKE3 hash, so only true byte-for-byte copies are listed. Windows, Program Files, AppData and tool caches are skipped, and cloud-only OneDrive files are never downloaded.</div>
+    <div class="card"><div class="muted" style="margin-bottom:6px">Folders to scan, one per line</div><textarea id="dpRoots" rows="3" style="width:100%">${esc(S.dupRoots.join('\n'))}</textarea>
+      <div class="row" style="margin-top:8px"><span class="muted">Add:</span><div class="chips">${qp.slice(0, 4).map(q => `<span class="chip" data-addroot="${esc(q.path)}">${esc(q.label)}</span>`).join('')}${drives.map(d => `<span class="chip" data-addroot="${esc(d.letter)}\\">${esc(d.letter)}\\</span>`).join('')}</div>
+        <span class="spacer"></span><label class="muted">Ignore files smaller than <input type="number" id="dpMin" min="0.1" step="0.5" value="${S.dupMin}" style="width:70px"> MB</label><button class="btn primary" id="dpGo">Find duplicates</button></div></div>
+    <div id="dpBody" style="margin-top:14px">${S.dup ? '' : '<div class="empty">Choose folders and press <b>Find duplicates</b>.</div>'}</div>`;
+  $$('[data-addroot]').forEach(c => c.onclick = () => {
+    const ta = $('#dpRoots'); const cur = ta.value.split('\n').map(x => x.trim()).filter(Boolean);
+    if (!cur.some(x => x.toLowerCase() === c.dataset.addroot.toLowerCase())) cur.push(c.dataset.addroot);
+    ta.value = cur.join('\n');
+  });
+  $('#dpGo').onclick = async () => {
+    S.dupRoots = $('#dpRoots').value.split('\n').map(x => x.trim()).filter(Boolean);
+    S.dupMin = Math.max(0.1, +$('#dpMin').value || 1);
+    const r = await busy('Comparing files', () => invoke('find_duplicates', { roots: S.dupRoots, minMb: S.dupMin })).catch(e => { toast(String(e), true); return null; });
+    if (!r) return;
+    S.dup = r; S.dupSel = new Set(); S.dupShown = 100; renderDupes();
+  };
+  renderDupes();
+};
+
+// ------------------------------------------------------------------ Recover Files
+
+async function recycleTab() {
+  const box = $('#rcBody');
+  box.innerHTML = '<div class="empty">Reading the Recycle Bin…</div>';
+  const items = await busy('Reading the Recycle Bin', () => invoke('recycle_list')).catch(e => { box.innerHTML = `<div class="empty">${esc(e)}</div>`; return null; });
+  if (!items) return;
+  S.bin = items; S.binSel = new Set();
+  const draw = () => {
+    const q = (($('#rbQ') || {}).value || '').toLowerCase();
+    const vis = S.bin.filter(i => !q || (i.name + ' ' + i.orig).toLowerCase().includes(q));
+    box.innerHTML = `<div class="row" style="margin-bottom:8px"><b>${S.bin.length} item(s) · ${fmt(S.bin.reduce((s, i) => s + i.size, 0))}</b><span class="spacer"></span><input type="text" id="rbQ" placeholder="Search name or folder…" value="${esc(q)}" style="width:240px"><button class="btn" id="rbAll">Select shown</button></div>
+      ${vis.length ? `<table><thead><tr><th></th><th>Name</th><th>Original folder</th><th>Deleted</th><th class="num">Size</th></tr></thead><tbody>
+      ${vis.slice(0, 400).map(i => `<tr><td style="width:30px"><input type="checkbox" data-rb="${esc(i.path)}" ${S.binSel.has(i.path) ? 'checked' : ''}></td><td><b>${esc(i.name)}</b>${i.isdir ? ' <span class="tag info">folder</span>' : ''}</td><td class="path muted">${esc(i.orig)}</td><td class="muted">${esc(i.deleted)}</td><td class="num">${fmt(i.size)}</td></tr>`).join('')}</tbody></table>${vis.length > 400 ? `<div class="muted" style="margin:8px">Showing 400 of ${vis.length}. Narrow the search.</div>` : ''}` : '<div class="empty">The Recycle Bin is empty.</div>'}<div id="rbSel"></div>`;
+    $('#rbQ').oninput = e => { const v = e.target.value; draw(); const el = $('#rbQ'); el.focus(); el.setSelectionRange(v.length, v.length); };
+    $('#rbAll').onclick = () => { vis.slice(0, 400).forEach(i => S.binSel.add(i.path)); draw(); };
+    $$('input[data-rb]').forEach(c => c.onchange = () => { c.checked ? S.binSel.add(c.dataset.rb) : S.binSel.delete(c.dataset.rb); upd(); });
+    const upd = () => {
+      const el = $('#rbSel');
+      if (!S.binSel.size) { el.innerHTML = ''; return; }
+      el.innerHTML = `<div class="sel-bar"><b>${S.binSel.size} selected</b><span class="spacer"></span><button class="btn primary" id="rbGo">Restore to original location</button></div>`;
+      $('#rbGo').onclick = async () => {
+        const paths = [...S.binSel];
+        const r = await busy('Restoring', () => invoke('recycle_restore', { paths })).catch(e => { toast(String(e), true); return null; });
+        if (!r) return;
+        toast(`${r.restored} of ${r.requested} restored` + (r.remaining ? ` · ${r.remaining} could not be restored (name conflict or missing folder)` : ''), r.remaining > 0);
+        recycleTab(); refreshDrive();
+      };
+    };
+    upd();
+  };
+  draw();
+}
+
+async function shadowTab() {
+  const box = $('#rcBody');
+  box.innerHTML = `<div class="muted" style="margin-bottom:10px">Windows keeps hidden snapshots of your drives (System Restore and backups). If one exists from before a file was deleted or changed, you can copy the old version out. Snapshots are only read, never changed. This only works when System Protection is on for that drive.</div>${S.admin ? '' : adminBanner()}<div id="shBody"><div class="empty">${S.admin ? 'Looking for snapshots…' : ''}</div></div>`;
+  bindAdmin();
+  if (!S.admin) return;
+  const list = await busy('Looking for snapshots', () => invoke('shadow_list')).catch(e => { $('#shBody').innerHTML = `<div class="empty">${esc(e)}</div>`; return null; });
+  if (!list) return;
+  if (!list.length) { $('#shBody').innerHTML = '<div class="empty">No snapshots exist on this PC. Turn on System Protection (System Properties → System Protection) to start keeping them.</div>'; return; }
+  const sys = S.sysDrive.replace(':', '');
+  S.shPath = S.shPath || (await invoke('quick_paths'))[0].path;
+  $('#shBody').innerHTML = `<div class="row"><label class="muted">Snapshot <select id="shSel">${list.map(s => `<option value="${esc(s.device)}">${esc(s.letter || '?')}: · ${esc(fdt(s.created))}</option>`).join('')}</select></label>
+      <input type="text" id="shPath" style="flex:1;min-width:260px" value="${esc(S.shPath)}"><button class="btn primary" id="shGo">Browse</button></div><div id="shList" style="margin-top:12px"></div>`;
+  const browse = async (path) => {
+    S.shPath = path; $('#shPath').value = path;
+    const m = path.match(/^([A-Za-z]):\\?(.*)$/);
+    if (!m) { toast('Enter a full path such as C:\\Users\\you\\Documents', true); return; }
+    const dev = $('#shSel').value, sel = list.find(s => s.device === dev);
+    if (sel && sel.letter && sel.letter.toUpperCase() !== m[1].toUpperCase()) toast(`This snapshot is of drive ${sel.letter}:, not ${m[1].toUpperCase()}:`, true);
+    const rows = await busy('Reading the snapshot', () => invoke('shadow_browse', { device: dev, path: m[2] })).catch(e => { toast(String(e), true); return null; });
+    if (!rows) return;
+    const sel2 = new Set();
+    const base = path.replace(/\\+$/, '');
+    $('#shList').innerHTML = `<div class="muted" style="margin-bottom:6px">${esc(base)}\\ · ${rows.length} entries</div>
+      <table><thead><tr><th></th><th>Name</th><th class="num">Size</th><th class="num">Modified</th></tr></thead><tbody>
+      ${base.length > 3 ? '<tr><td></td><td><span class="lnk" data-up="1">⬑ Up</span></td><td></td><td></td></tr>' : ''}
+      ${rows.map((r, i) => `<tr><td style="width:30px"><input type="checkbox" data-sh="${i}"></td><td>${r.is_dir ? `<span class="lnk" data-dir="${esc(r.name)}">📁 ${esc(r.name)}</span>` : esc(r.name)}</td><td class="num">${r.is_dir ? '' : fmt(r.size)}</td><td class="num muted">${fdate(r.modified)}</td></tr>`).join('')}</tbody></table><div id="shAct"></div>`;
+    $$('[data-dir]').forEach(a => a.onclick = () => browse(base + '\\' + a.dataset.dir));
+    const up = $('[data-up]'); if (up) up.onclick = () => browse(base.replace(/\\[^\\]*$/, '') || base.slice(0, 3));
+    $$('input[data-sh]').forEach(c => c.onchange = () => {
+      c.checked ? sel2.add(+c.dataset.sh) : sel2.delete(+c.dataset.sh);
+      const el = $('#shAct');
+      if (!sel2.size) { el.innerHTML = ''; return; }
+      el.innerHTML = `<div class="sel-bar"><b>${sel2.size} selected</b><span class="spacer"></span><button class="btn primary" id="shRestore">Copy out…</button></div>`;
+      $('#shRestore').onclick = async () => {
+        const dflt = (await invoke('quick_paths'))[1].path + '\\Recovered files';
+        const r = await modal({ title: 'Copy old versions to', body: `<input type="text" name="dest" style="width:100%" value="${esc(dflt)}"><div class="muted" style="margin-top:8px">Nothing is overwritten. If a name already exists, the copy gets a "(recovered n)" suffix.</div>`, buttons: [{ label: 'Cancel', value: false }, { label: 'Copy', value: true, cls: 'primary' }] });
+        if (!r.value) return;
+        const rels = [...sel2].map(i => (m[2] ? m[2].replace(/\\+$/, '') + '\\' : '') + rows[i].name);
+        const res = await busy('Copying', () => invoke('shadow_restore', { device: dev, paths: rels, dest: r.data.dest })).catch(e => { toast(String(e), true); return null; });
+        if (!res) return;
+        await alertBox('Copied', `<b>${res.files}</b> file(s) · ${fmt(res.bytes)} copied to <code>${esc(res.dest)}</code>${res.errors.length ? `<div style="margin-top:8px" class="muted">${res.errors.slice(0, 5).map(esc).join('<br>')}</div>` : ''}`);
+        invoke('reveal_in_explorer', { path: res.dest });
+      };
+    });
+  };
+  $('#shGo').onclick = () => browse($('#shPath').value.trim());
+}
+
+VIEWS.recover = async () => {
+  await refreshBadges();
+  S.rcTab = S.rcTab || 'bin';
+  $('#view').innerHTML = `<h2>Recover Files</h2><div class="sub">Three safe layers, from easiest to deepest. Files removed through this app are in <b>Quarantine & History</b> and can be restored there.</div>
+    <div class="chips" style="margin-bottom:14px"><span class="chip ${S.rcTab === 'bin' ? 'on' : ''}" data-t="bin">Recycle Bin</span><span class="chip ${S.rcTab === 'shadow' ? 'on' : ''}" data-t="shadow">Previous versions</span><span class="chip ${S.rcTab === 'deep' ? 'on' : ''}" data-t="deep">Deleted for good?</span><span class="chip" data-t="q">Quarantine →</span></div><div id="rcBody"></div>`;
+  $$('[data-t]').forEach(c => c.onclick = () => { if (c.dataset.t === 'q') { go('quarantine'); return; } S.rcTab = c.dataset.t; VIEWS.recover(); });
+  if (S.rcTab === 'bin') recycleTab();
+  else if (S.rcTab === 'shadow') shadowTab();
+  else $('#rcBody').innerHTML = `<div class="card"><h3>If a file is gone from the Recycle Bin</h3>
+    <div class="muted" style="line-height:1.6">Deleted files can often be carved back from the disk, but only until the space is reused. The odds depend on the drive:
+    <table style="margin:10px 0"><thead><tr><th>Drive</th><th>Chance</th><th>Why</th></tr></thead><tbody>
+    <tr><td>Hard disk (HDD)</td><td><span class="tag safe">good, if you act fast</span></td><td>Deleted data stays until overwritten.</td></tr>
+    <tr><td>SSD / NVMe with TRIM</td><td><span class="tag keep">usually none</span></td><td>Windows tells the SSD to erase freed blocks within moments.</td></tr>
+    <tr><td>USB stick / SD card</td><td><span class="tag review">often possible</span></td><td>Usually no TRIM.</td></tr></tbody></table>
+    <b>What to do now:</b> stop using that drive, do not install recovery software onto it, and run Microsoft's free <code>winfr</code> (Windows File Recovery from the Microsoft Store) from another drive. Check <b>Previous versions</b> first: it needs no carving and works on SSDs too.</div></div>`;
+};
+
+// ------------------------------------------------------------------ Phase 2: batch runner
+
+async function runFixBatch(ids, title, after) {
+  const lines = [];
+  let logEl = null, stateEl = null, stopEl = null, finished = false, cancelled = false, cur = null;
+  const paint = msg => {
+    if (logEl) { logEl.textContent = lines.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
+    if (stateEl && msg) stateEl.textContent = msg;
+  };
+  const waiters = {};
+  const u1 = await listen('fix-line', e => { if (e.payload.id === cur) { lines.push(e.payload.line); if (lines.length > 4000) lines.shift(); paint(); } });
+  const u2 = await listen('fix-done', e => { const w = waiters[e.payload.id]; if (w) w(e.payload); });
+  const mp = modal({
+    title: esc(title),
+    body: '<div class="muted" id="fxState">Starting…</div><pre class="term" id="fxLog"></pre>',
+    buttons: [
+      { label: 'Stop', value: 'stop', cls: 'danger', keep: true, onClick: () => { cancelled = true; if (cur) invoke('cancel_fix', { reqId: cur }); } },
+      { label: 'Close', value: 'close', cls: 'primary' },
+    ],
+    onOpen: root => { logEl = $('#fxLog', root); stateEl = $('#fxState', root); stopEl = $$('.mfoot button', root)[0]; paint(); },
+  });
+  let ok = 0, bad = 0;
+  for (let i = 0; i < ids.length && !cancelled; i++) {
+    const id = ids[i];
+    cur = 'b' + Date.now() + '_' + i;
+    lines.push(`── ${id.replace(/^(winget|debloat):/, '')} (${i + 1}/${ids.length}) ──`);
+    paint(`Working on ${i + 1} of ${ids.length}… keep this window open.`);
+    const done = new Promise(res => { waiters[cur] = res; });
+    try { await invoke('run_fix', { id, reqId: cur }); } catch (e) { lines.push('Could not start: ' + e); bad++; continue; }
+    const d = await done;
+    if (d.error || (d.code !== 0 && d.code != null && !d.cancelled)) { bad++; lines.push(d.error ? 'Failed: ' + d.error : `Finished with exit code ${d.code}.`); } else ok++;
+  }
+  paint(`${cancelled ? 'Stopped. ' : ''}${ok} finished, ${bad} reported a problem.`);
+  if (stopEl) stopEl.classList.add('hidden');
+  const r = await mp; u1(); u2();
+  if (after) after(ok, bad);
+  return r;
+}
+
+// ------------------------------------------------------------------ Optimize
+
+VIEWS.optimize = async () => {
+  $('#view').innerHTML = '<h2>Optimize</h2><div class="sub">Reading current settings…</div>';
+  const [t, plans, bloat] = await busy('Reading settings', () => Promise.all([invoke('list_tweaks'), invoke('list_power_plans').catch(() => []), invoke('list_bloat').catch(() => [])]));
+  await refreshBadges();
+  if (S.page !== 'optimize') return;
+  S.bloatSel = new Set();
+  const groups = [...new Set(t.tweaks.map(x => x.group))];
+  $('#view').innerHTML = `<h2>Optimize</h2><div class="sub">Small, reversible changes. Each one says exactly what it changes. These reduce clutter, background activity and disk use; none of them is a magic speed boost, and the app does not claim one. Turning a switch off puts back the value Windows had before.</div>${adminBanner()}
+    <div class="card row" style="gap:14px"><div style="flex:1"><b>Create a restore point first</b><div class="muted">One click saves a System Restore snapshot, so you can roll Windows settings back if you ever want to. Needs Administrator, and Windows allows one per 24 hours.</div></div><button class="btn primary" id="opRp">Create restore point</button></div>
+    ${plans.length ? `<h3 style="margin:18px 0 8px">Power plan</h3><div class="card"><div class="chips">${plans.map(p => `<span class="chip ${p.active ? 'on' : ''}" data-plan="${esc(p.guid)}">${esc(p.name)}${p.active ? ' · active' : ''}</span>`).join('')}</div><div class="muted" style="margin-top:8px">Performance plans keep the CPU clocks higher and use more power. On a laptop that shortens battery life. Pick any plan to switch; pick the old one to switch back.</div></div>` : ''}
+    ${groups.map(g => `<h3 style="margin:18px 0 8px">${esc(g)}</h3><div class="card" style="padding:4px 16px">${t.tweaks.filter(x => x.group === g).map(x => `<div class="row" style="padding:12px 0;border-bottom:1px solid var(--line);gap:14px">
+      <label class="switch"><input type="checkbox" data-tw="${esc(x.id)}" ${x.applied ? 'checked' : ''}><i></i></label>
+      <div style="flex:1"><b>${esc(x.title)}</b>${x.machine ? ' <span class="tag review">Administrator</span>' : ''}${x.id === 'hibernate' && t.hiber_bytes ? ` <span class="tag info">hiberfil.sys is ${fmt(t.hiber_bytes)}</span>` : ''}
+      <div class="muted">${esc(x.desc)}</div>${x.caution ? `<div class="muted" style="color:var(--warn,#f59e0b)">⚠ ${esc(x.caution)}</div>` : ''}</div></div>`).join('')}</div>`).join('')}
+    <h3 style="margin:22px 0 8px">Debloat: Microsoft Store apps</h3>
+    <div class="muted" style="margin-bottom:8px">Only apps on a fixed list can be removed, and only for your account. Anything can be reinstalled from the Microsoft Store. Items marked <span class="tag keep">check first</span> are used by some people.</div>
+    <div id="bloatBox"></div>`;
+  bindAdmin();
+  $('#opRp').onclick = () => {
+    if (!S.admin) { toast('Creating a restore point needs Administrator rights.', true); return; }
+    runFixUI('restore_point', 'Create a restore point');
+  };
+  $$('[data-plan]').forEach(c => c.onclick = async () => {
+    try { await invoke('set_power_plan', { guid: c.dataset.plan }); toast('Power plan changed.'); VIEWS.optimize(); } catch (e) { toast(String(e), true); }
+  });
+  $$('input[data-tw]').forEach(c => c.onchange = async () => {
+    const x = t.tweaks.find(y => y.id === c.dataset.tw);
+    if (x.caution) {
+      const ok = await modal({ title: esc(x.title), body: `<div>${esc(x.desc)}</div><div class="banner warn" style="margin-top:10px"><span>${esc(x.caution)}</span></div>`, buttons: [{ label: 'Cancel', value: false }, { label: c.checked ? 'Apply' : 'Undo', value: true, cls: 'primary' }] });
+      if (!ok.value) { c.checked = !c.checked; return; }
+    }
+    c.disabled = true;
+    try { await invoke('set_tweak', { id: x.id, on: c.checked }); toast(`${x.title}: ${c.checked ? 'applied' : 'undone'}.`); if (x.id === 'hibernate') { refreshDrive(); VIEWS.optimize(); return; } }
+    catch (e) { c.checked = !c.checked; toast(String(e), true); }
+    c.disabled = false;
+  });
+  const drawBloat = () => {
+    const box = $('#bloatBox');
+    if (!bloat.length) { box.innerHTML = '<div class="empty">None of the listed apps are installed.</div>'; return; }
+    box.innerHTML = `<table><thead><tr><th style="width:30px"></th><th>App</th><th>Note</th></tr></thead><tbody>${bloat.map((b, i) => `<tr><td><input type="checkbox" data-bl="${i}" ${S.bloatSel.has(i) ? 'checked' : ''}></td><td><b>${esc(b.label)}</b> ${b.caution ? '<span class="tag keep">check first</span>' : ''}<div class="muted">${esc(b.name)}</div></td><td class="muted">${esc(b.note)}</td></tr>`).join('')}</tbody></table><div id="blSel"></div>`;
+    $$('input[data-bl]').forEach(c => c.onchange = () => { c.checked ? S.bloatSel.add(+c.dataset.bl) : S.bloatSel.delete(+c.dataset.bl); upd(); });
+    const upd = () => {
+      const el = $('#blSel');
+      if (!S.bloatSel.size) { el.innerHTML = ''; return; }
+      el.innerHTML = `<div class="sel-bar"><b>${S.bloatSel.size} selected</b><span class="spacer"></span><button class="btn danger" id="blGo">Remove selected</button></div>`;
+      $('#blGo').onclick = async () => {
+        const picked = [...S.bloatSel].map(i => bloat[i]);
+        const c = await modal({ title: `Remove ${picked.length} app(s)?`, body: `<ul class="plist">${picked.map(p => `<li>${esc(p.label)}</li>`).join('')}</ul><div class="muted">Removed for your account only. You can reinstall any of them from the Microsoft Store. Creating a restore point first is a good habit.</div>`, buttons: [{ label: 'Cancel', value: false }, { label: 'Remove', value: true, cls: 'danger' }] });
+        if (!c.value) return;
+        await runFixBatch(picked.map(p => 'debloat:' + p.name), 'Removing apps', () => VIEWS.optimize());
+      };
+    };
+    upd();
+  };
+  drawBloat();
+};
+
+// ------------------------------------------------------------------ Programs (uninstaller)
+
+VIEWS.apps = async () => {
+  $('#view').innerHTML = '<h2>Programs</h2><div class="sub">Reading installed programs…</div>';
+  const items = S.apps = await busy('Reading installed programs', () => invoke('list_installed')).catch(e => { toast(String(e), true); return []; });
+  if (S.page !== 'apps') return;
+  S.appSort = S.appSort || 'name';
+  const draw = () => {
+    const q = (($('#apQ') || {}).value || '').toLowerCase();
+    let vis = items.filter(a => !q || (a.name + ' ' + a.publisher).toLowerCase().includes(q));
+    const key = S.appSort;
+    vis = [...vis].sort((a, b) => key === 'size' ? b.size - a.size : key === 'date' ? (b.installed || '').localeCompare(a.installed || '') : a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+    $('#apBody').innerHTML = `<table><thead><tr><th>Program</th><th>Publisher</th><th>Version</th><th>Installed</th><th class="num">Size</th><th></th></tr></thead><tbody>
+      ${vis.map(a => `<tr><td><b>${esc(a.name)}</b></td><td class="muted">${esc(a.publisher)}</td><td class="muted">${esc(a.version)}</td><td class="muted">${esc(a.installed || '–')}</td><td class="num">${a.size ? fmt(a.size) : '–'}</td><td class="num"><button class="btn sm danger" data-un="${esc(a.id)}">Uninstall</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">No match.</td></tr>'}</tbody></table>`;
+    $$('[data-un]').forEach(b => b.onclick = async () => {
+      const a = items.find(x => x.id === b.dataset.un);
+      const sec = /antivirus|security|defender|firewall|malware|endpoint/i.test(a.name);
+      const c = await modal({ title: `Uninstall ${esc(a.name)}?`, body: `<div>This starts the program's own uninstaller${a.publisher ? ' (' + esc(a.publisher) + ')' : ''}. Its window may appear and may ask questions.</div>${sec ? '<div class="banner warn" style="margin-top:10px"><span>This looks like security software. Removing it can leave the PC unprotected.</span></div>' : ''}${a.quiet ? '<label class="check" style="margin-top:10px"><input type="checkbox" name="quiet"> Silent uninstall (no questions)</label>' : ''}`, buttons: [{ label: 'Cancel', value: false }, { label: 'Uninstall', value: true, cls: 'danger' }] });
+      if (!c.value) return;
+      try { await invoke('uninstall_app', { id: a.id, quiet: !!c.data.quiet }); toast('Uninstaller started. The list refreshes when it finishes.'); }
+      catch (e) { toast(String(e), true); }
+    });
+  };
+  $('#view').innerHTML = `<h2>Programs</h2><div class="sub">${items.length} installed programs. Uses each program's own uninstaller, the same one as Windows Settings. Size is what the program reports; it can be missing or approximate.</div>
+    <div class="row" style="margin:10px 0"><div class="chips">${[['name', 'Name'], ['size', 'Largest'], ['date', 'Newest']].map(([k, l]) => `<span class="chip ${S.appSort === k ? 'on' : ''}" data-s="${k}">${l}</span>`).join('')}</div><span class="spacer"></span><input type="text" id="apQ" placeholder="Search…" style="width:240px"></div><div id="apBody"></div>`;
+  draw();
+  $('#apQ').oninput = draw;
+  $$('[data-s]').forEach(c => c.onclick = () => { S.appSort = c.dataset.s; $$('[data-s]').forEach(x => x.classList.toggle('on', x === c)); draw(); });
+  if (!S.uninstallBound) {
+    S.uninstallBound = true;
+    listen('uninstall-done', () => { refreshDrive(); if (S.page === 'apps') VIEWS.apps(); });
+  }
+};
+
+// ------------------------------------------------------------------ Updates (winget)
+
+VIEWS.updates = async () => {
+  $('#view').innerHTML = '<h2>Updates</h2><div class="sub">Asking winget what has a newer version… this usually takes a few seconds, up to a minute when winget refreshes its package list.</div>';
+  const res = await busy('Checking for updates', () => invoke('list_updates')).catch(e => {
+    const msg = String(e), v6 = msg.startsWith('IPV6:');
+    $('#view').innerHTML = `<h2>Updates</h2><div class="empty">${esc(msg.replace(/^(IPV6|TIMEOUT):/, ''))}<div style="margin-top:12px">${v6 ? '<button class="btn primary" id="upV4">Prefer IPv4 (fix)</button> ' : ''}<button class="btn" id="upRetry">Try again</button></div></div>`;
+    $('#upRetry').onclick = () => VIEWS.updates();
+    if (v6) $('#upV4').onclick = () => runFixBatch(['prefer_ipv4'], 'Preferring IPv4', () => VIEWS.updates());
+    return null;
+  });
+  if (!res || S.page !== 'updates') return;
+  const { items, note } = res;
+  const sel = new Set();
+  const draw = () => {
+    $('#view').innerHTML = `<h2>Updates</h2><div class="sub">Program updates from winget, Microsoft's package manager. Installers come from winget's package sources. Only programs winget recognises are listed. Some updaters ask for Administrator approval or close the running program.</div>
+      ${note ? `<div class="banner info">${esc(note)}</div>` : ''}<div class="row" style="margin:10px 0"><b>${items.length} update(s) available</b><span class="spacer"></span><button class="btn" id="upRe">Check again</button>${items.length ? '<button class="btn primary" id="upAll">Update all</button>' : ''}</div>
+      ${items.length ? `<table><thead><tr><th style="width:30px"></th><th>Program</th><th>Installed</th><th>Available</th><th>Source</th></tr></thead><tbody>${items.map((u, i) => `<tr><td><input type="checkbox" data-u="${i}" ${sel.has(i) ? 'checked' : ''}></td><td><b>${esc(u.name)}</b><div class="muted">${esc(u.id)}</div></td><td class="muted">${esc(u.version)}</td><td>${esc(u.available)}</td><td class="muted">${esc(u.source)}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">Everything winget manages is up to date.</div>'}<div id="upSel"></div>`;
+    $('#upRe').onclick = () => VIEWS.updates();
+    const all = $('#upAll'); if (all) all.onclick = async () => {
+      const c = await modal({ title: `Update all ${items.length} programs?`, body: '<div class="muted">Programs that are open may be closed by their updater. Save your work first.</div>', buttons: [{ label: 'Cancel', value: false }, { label: 'Update all', value: true, cls: 'primary' }] });
+      if (c.value) await runFixBatch(['winget_all'], 'Updating all programs', () => VIEWS.updates());
+    };
+    $$('input[data-u]').forEach(c => c.onchange = () => {
+      c.checked ? sel.add(+c.dataset.u) : sel.delete(+c.dataset.u);
+      const el = $('#upSel');
+      if (!sel.size) { el.innerHTML = ''; return; }
+      el.innerHTML = `<div class="sel-bar"><b>${sel.size} selected</b><span class="spacer"></span><button class="btn primary" id="upGo">Update selected</button></div>`;
+      $('#upGo').onclick = () => runFixBatch([...sel].map(i => 'winget:' + items[i].id), 'Updating programs', () => VIEWS.updates());
+    });
+  };
+  draw();
+};
+
+// ------------------------------------------------------------------ Phase 3: Processes
+
+const dayName = m => ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].filter((_, i) => m & (1 << i)).join(', ');
+
+VIEWS.procs = async () => {
+  $('#view').innerHTML = '<h2>Processes</h2><div class="sub">Reading running programs…</div>';
+  let list = [];
+  const load = async () => { list = await invoke('list_processes'); };
+  await busy('Reading processes', load).catch(e => toast(String(e), true));
+  if (S.page !== 'procs') return;
+  S.pGroup = S.pGroup !== false; S.pSort = S.pSort || 'mem';
+  const rows = () => {
+    const q = (($('#prQ') || {}).value || '').toLowerCase();
+    let v = list.filter(p => !q || (p.name + ' ' + p.path).toLowerCase().includes(q));
+    if (S.pGroup) {
+      const m = new Map();
+      v.forEach(p => { const k = p.name.toLowerCase(); const g = m.get(k) || { name: p.name, path: p.path, pids: [], cpu: 0, mem: 0 }; g.pids.push(p.pid); g.cpu += p.cpu; g.mem += p.mem; m.set(k, g); });
+      v = [...m.values()];
+    } else v = v.map(p => ({ name: p.name, path: p.path, pids: [p.pid], cpu: p.cpu, mem: p.mem }));
+    return v.sort((a, b) => S.pSort === 'cpu' ? b.cpu - a.cpu : S.pSort === 'name' ? a.name.toLowerCase().localeCompare(b.name.toLowerCase()) : b.mem - a.mem);
+  };
+  const draw = () => {
+    const v = rows();
+    $('#prBody').innerHTML = `<table><thead><tr><th>Program</th><th class="num">Count</th><th class="num">CPU</th><th class="num">Memory</th><th></th></tr></thead><tbody>
+      ${v.slice(0, 300).map((p, i) => `<tr><td><b>${esc(p.name)}</b><div class="muted path"><code>${esc(p.path || 'system process')}</code></div></td><td class="num">${p.pids.length}</td><td class="num">${p.cpu.toFixed(1)}%</td><td class="num">${fmt(p.mem)}</td>
+      <td class="num"><button class="btn sm" data-ai="${i}">AI: explain</button> <button class="btn sm danger" data-end="${i}">End…</button></td></tr>`).join('')}</tbody></table>`;
+    $$('[data-end]').forEach(b => b.onclick = async () => {
+      const p = v[+b.dataset.end];
+      const c = await modal({ title: `End ${esc(p.name)}?`, body: `<div>${p.pids.length > 1 ? `This ends all ${p.pids.length} running copies.` : 'This ends the program immediately.'} Unsaved work in it is lost.</div><div class="muted" style="margin-top:8px">Protected Windows processes are refused automatically.</div>`, buttons: [{ label: 'Cancel', value: false }, { label: 'End now', value: true, cls: 'danger' }] });
+      if (!c.value) return;
+      let ok = 0, err = null;
+      for (const pid of p.pids) { try { await invoke('end_process', { pid, name: p.name }); ok++; } catch (e) { err = String(e); } }
+      toast(err && !ok ? err : `${ok} ended` + (err ? ` · ${err}` : ''), !!err && !ok);
+      await load(); draw();
+    });
+    $$('[data-ai]').forEach(b => b.onclick = () => {
+      const p = v[+b.dataset.ai];
+      go('ai'); setTimeout(() => sendChat(`What is the Windows process "${p.name}"${p.path ? ' running from ' + p.path : ''}? It uses ${fmt(p.mem)} of memory. Is it normal, and is it safe to end? Do not tell me to end anything unless it is clearly optional.`), 150);
+    });
+  };
+  const ram = await invoke('health_check').then(h => `${fmt(h.ram_used)} of ${fmt(h.ram_total)} in use`).catch(() => '');
+  $('#view').innerHTML = `<h2>Processes</h2><div class="sub">A live look at what is running. Memory is private working set, CPU is the share of all cores at the moment of reading. There is no "RAM booster" here: ending a program is always one explicit, confirmed action. ${ram ? '<b>' + ram + '.</b>' : ''}</div>
+    <div class="row" style="margin:10px 0"><div class="chips">${[['mem', 'Memory'], ['cpu', 'CPU'], ['name', 'Name']].map(([k, l]) => `<span class="chip ${S.pSort === k ? 'on' : ''}" data-s="${k}">${l}</span>`).join('')}<span class="chip ${S.pGroup ? 'on' : ''}" id="prG">Group by program</span></div><span class="spacer"></span>
+      <input type="text" id="prQ" placeholder="Search…" style="width:220px"><button class="btn" id="prRe">Refresh</button></div><div id="prBody"></div>`;
+  draw();
+  $('#prQ').oninput = draw;
+  $('#prRe').onclick = async () => { await busy('Reading processes', load); draw(); };
+  $('#prG').onclick = e => { S.pGroup = !S.pGroup; e.target.classList.toggle('on', S.pGroup); draw(); };
+  $$('[data-s]').forEach(c => c.onclick = () => { S.pSort = c.dataset.s; $$('[data-s]').forEach(x => x.classList.toggle('on', x === c)); draw(); });
+};
+
+// ------------------------------------------------------------------ Browser privacy
+
+VIEWS.browsers = async () => {
+  $('#view').innerHTML = '<h2>Browser Privacy</h2><div class="sub">Looking for browser data…</div>';
+  const r = await busy('Reading browser data', () => invoke('list_browser_data')).catch(e => { toast(String(e), true); return null; });
+  if (!r || S.page !== 'browsers') return;
+  const sel = new Set();
+  const draw = () => {
+    const items = r.items;
+    const groups = {};
+    items.forEach(i => { const k = `${i.browser}|${i.profile}|${i.category}`; (groups[k] = groups[k] || { browser: i.browser, profile: i.profile, category: i.category, files: [], size: 0 }); groups[k].files.push(i.path); groups[k].size += i.size; });
+    const list = Object.values(groups);
+    $('#view').innerHTML = `<h2>Browser Privacy</h2><div class="sub">Clears cookies and browsing history. Files go to <b>Quarantine</b>, so you can put them back. Passwords, bookmarks, autofill and extensions are never listed. Browser caches are cleaned on the <b>Safe Clean</b> page. The browser must be closed.</div>
+      ${r.running.length ? `<div class="banner warn"><span>${esc(r.running.join(', '))} ${r.running.length > 1 ? 'are' : 'is'} open. Close ${r.running.length > 1 ? 'them' : 'it'} to clean ${r.running.length > 1 ? 'their' : 'its'} data.</span><button class="btn sm" id="brRe">Check again</button></div>` : ''}
+      ${list.length ? `<table><thead><tr><th style="width:30px"></th><th>Browser</th><th>Profile</th><th>What</th><th class="num">Size</th></tr></thead><tbody>
+      ${list.map((g, i) => `<tr><td><input type="checkbox" data-g="${i}" ${r.running.includes(g.browser) ? 'disabled' : ''} ${g.files.every(f => sel.has(f)) ? 'checked' : ''}></td><td><b>${esc(g.browser)}</b>${r.running.includes(g.browser) ? ' <span class="tag keep">open</span>' : ''}</td><td class="muted">${esc(g.profile)}</td>
+        <td>${g.category === 'cookies' ? 'Cookies <span class="muted">(you will be signed out of websites)</span>' : 'Browsing history <span class="muted">(history, visited links, top sites, address-bar shortcuts)</span>'}</td><td class="num">${fmt(g.size)}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No Chrome, Edge, Brave or Firefox data found.</div>'}<div id="brSel"></div>`;
+    const re = $('#brRe'); if (re) re.onclick = () => VIEWS.browsers();
+    $$('input[data-g]').forEach(c => c.onchange = () => {
+      list[+c.dataset.g].files.forEach(f => c.checked ? sel.add(f) : sel.delete(f));
+      const el = $('#brSel');
+      if (!sel.size) { el.innerHTML = ''; return; }
+      el.innerHTML = `<div class="sel-bar"><b>${[...$$('input[data-g]')].filter(x => x.checked).length} item(s) selected</b><span class="spacer"></span><button class="btn danger" id="brGo">Clear selected</button></div>`;
+      $('#brGo').onclick = async () => {
+        const ok = await modal({ title: 'Clear browser data?', body: '<div>Cookies sign you out of websites. History is removed from the address-bar suggestions. Both can be restored from <b>Quarantine & History</b> until it auto-purges.</div>', buttons: [{ label: 'Cancel', value: false }, { label: 'Clear', value: true, cls: 'danger' }] });
+        if (!ok.value) return;
+        const rep = await busy('Clearing', () => invoke('clean_browser', { paths: [...sel] })).catch(e => { toast(String(e), true); return null; });
+        if (!rep) return;
+        await alertBox(rep.ok ? 'Done' : 'Nothing was cleared', `<div><b>${rep.ok}</b> file(s) moved to Quarantine · ${fmt(rep.bytes)}</div>${failList(rep.failed)}`);
+        VIEWS.browsers();
+      };
+    });
+  };
+  draw();
+};
+
+// ------------------------------------------------------------------ Schedule
+
+VIEWS.schedule = async () => {
+  $('#view').innerHTML = '<h2>Schedule</h2><div class="sub">Loading…</div>';
+  const [st, choices] = await busy('Reading schedule', () => Promise.all([invoke('schedule_status'), invoke('schedule_choices')])).catch(e => { toast(String(e), true); return [null, []]; });
+  await refreshBadges();
+  if (S.page !== 'schedule') return;
+  const s = S.settings; const ids = new Set(s.auto_clean_ids || []);
+  const groups = [...new Set(choices.map(c => c.group))];
+  const frNow = st ? (st.kind.includes('Daily') ? 'daily' : 'weekly') : 'weekly';
+  $('#view').innerHTML = `<h2>Schedule</h2><div class="sub">Runs an automatic clean in the background through a normal Windows scheduled task (no service is installed). It only ever runs the safe targets you tick below, needs no Administrator rights, and writes every run to <b>Quarantine & History</b>.</div>
+    <div class="card"><div class="row"><b>Status</b><span class="spacer"></span>${st ? `<span class="tag ${st.state === 'Ready' ? 'safe' : 'info'}">${esc(st.state)}</span>` : '<span class="tag info">not scheduled</span>'}</div>
+      ${st ? `<div class="kv" style="margin-top:8px"><div>When</div><div>${frNow === 'daily' ? 'Every day' : 'Every ' + esc(dayName(st.days))} at ${esc(st.at)}</div><div>Next run</div><div>${esc(st.next ? st.next.replace('T', ' ').slice(0, 16) : '–')}</div><div>Last run</div><div>${esc(st.last ? st.last.replace('T', ' ').slice(0, 16) : 'never')}${st.last ? ' · result ' + st.result : ''}</div></div>` : ''}</div>
+    <div class="card" style="margin-top:14px"><h3>Set up</h3><div class="row" style="gap:14px;margin:8px 0">
+      <label>Repeat<br><select id="scF"><option value="weekly" ${frNow === 'weekly' ? 'selected' : ''}>Weekly</option><option value="daily" ${frNow === 'daily' ? 'selected' : ''}>Daily</option></select></label>
+      <label id="scDl">Day<br><select id="scD">${['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].map(d => `<option ${d === 'Sunday' ? 'selected' : ''}>${d}</option>`).join('')}</select></label>
+      <label>Time<br><input type="time" id="scT" value="${st && st.at ? esc(st.at) : '12:00'}"></label></div>
+      <div class="muted" style="margin:10px 0 4px">What to clean. Only safe targets that need no Administrator can run unattended. Tick a browser cache only if that browser is usually closed at that time:</div>
+      ${groups.map(g => `<div style="margin:6px 0"><b>${esc(g)}</b>${choices.filter(c => c.group === g).map(c => `<label class="check"><input type="checkbox" data-id="${esc(c.id)}" ${ids.has(c.id) ? 'checked' : ''}> ${esc(c.name)} <span class="muted">· ${esc(c.tip)}</span></label>`).join('')}</div>`).join('')}
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="scSave">${st ? 'Update schedule' : 'Create schedule'}</button><button class="btn" id="scNow">Run a clean now</button>${st ? '<button class="btn danger" id="scDel">Remove schedule</button>' : ''}</div></div>`;
+  const sync = () => $('#scDl').classList.toggle('hidden', $('#scF').value === 'daily');
+  $('#scF').onchange = sync; sync();
+  if (st && st.days) { const names = dayName(st.days).split(', '); if (names[0]) $('#scD').value = names[0]; }
+  const saveIds = async () => {
+    const picked = $$('input[data-id]').filter(c => c.checked).map(c => c.dataset.id);
+    S.settings = await invoke('set_settings', { settings: { ...S.settings, auto_clean_ids: picked } });
+    return picked;
+  };
+  $('#scSave').onclick = async () => {
+    const picked = await saveIds();
+    if (!picked.length) { toast('Tick at least one thing to clean.', true); return; }
+    try { await invoke('schedule_set', { freq: $('#scF').value, day: $('#scD').value, time: $('#scT').value || '12:00' }); toast('Schedule saved.'); VIEWS.schedule(); } catch (e) { toast(String(e), true); }
+  };
+  $('#scNow').onclick = async () => {
+    const picked = await saveIds();
+    if (!picked.length) { toast('Tick at least one thing to clean.', true); return; }
+    const r = await busy('Cleaning', () => invoke('schedule_run_now')).catch(e => { toast(String(e), true); return null; });
+    if (r) { toast(`Done · ${fmt(r.freed)} freed from ${r.targets} target(s)`); refreshDrive(); }
+  };
+  const del = $('#scDel'); if (del) del.onclick = async () => { try { await invoke('schedule_remove'); toast('Schedule removed.'); VIEWS.schedule(); } catch (e) { toast(String(e), true); } };
+};
+
+// ------------------------------------------------------------------ Diagnostics (event log + AI)
+
+VIEWS.diag = async () => {
+  S.diagDays = S.diagDays || 7;
+  $('#view').innerHTML = '<h2>Diagnostics</h2><div class="sub">Reading the Windows event log…</div>';
+  const g = await busy('Reading event log', () => invoke('list_event_groups', { days: S.diagDays })).catch(e => { toast(String(e), true); return null; });
+  if (!g || S.page !== 'diag') return;
+  const text = (x) => `${x.provider} (event id ${x.id}, log ${x.log}, ${x.level}): ${x.count}× in ${S.diagDays} days, last ${x.last}. Example: ${x.message}`;
+  $('#view').innerHTML = `<h2>Diagnostics</h2><div class="sub">Critical and error events from the System and Application logs, plus hardware-error warnings, grouped so repeats stand out. This is read-only. The AI only explains; it never changes anything. A few errors are normal on every PC, so look for ones that repeat many times.</div>
+    <div class="row" style="margin:10px 0"><div class="chips">${[1, 3, 7, 14, 30].map(d => `<span class="chip ${S.diagDays === d ? 'on' : ''}" data-d="${d}">${d} day${d > 1 ? 's' : ''}</span>`).join('')}</div><span class="spacer"></span>${g.length ? '<button class="btn primary" id="dgAll">Ask AI about the top problems</button>' : ''}</div>
+    ${g.length ? `<table><thead><tr><th class="num">Count</th><th>Source</th><th>Last seen</th><th>Message</th><th></th></tr></thead><tbody>${g.map((x, i) => `<tr><td class="num"><b>${x.count}</b></td><td><b>${esc(x.provider)}</b><div class="muted">id ${x.id} · ${esc(x.log)} · ${esc(x.level)}</div></td><td class="muted">${esc(x.last)}</td><td class="muted">${esc(x.message)}</td><td class="num"><button class="btn sm" data-x="${i}">Explain</button></td></tr>`).join('')}</tbody></table>` : `<div class="empty">No critical or error events in the last ${S.diagDays} day(s). 🎉</div>`}`;
+  $$('[data-d]').forEach(c => c.onclick = () => { S.diagDays = +c.dataset.d; VIEWS.diag(); });
+  $$('[data-x]').forEach(b => b.onclick = () => { const x = g[+b.dataset.x]; go('ai'); setTimeout(() => sendChat(`Explain this Windows event in plain language: what it means, the usual causes, whether it matters, and what I could check next. Do not suggest registry cleaners or "boost" tools.\n\n${text(x)}`), 150); });
+  const all = $('#dgAll'); if (all) all.onclick = () => { go('ai'); setTimeout(() => sendChat(`These are the most frequent Windows errors on my PC in the last ${S.diagDays} days. Group them into likely root causes, tell me which ones matter and which are harmless noise, and give me a short ordered list of safe things to check. Do not suggest registry cleaners or "boost" tools.\n\n${g.slice(0, 15).map(text).join('\n')}`), 150); };
+};
+
 // ------------------------------------------------------------------ AI Assistant
 
 const isThinkModel = n => !!(S.ollama.models.find(m => m.name === n) || {}).thinking;
@@ -861,13 +1539,14 @@ VIEWS.settings = async () => {
         <label>Quarantine auto-purge (days, 0 = never)<br><input type="number" id="stDays" min="0" value="${s.quarantine_days}" style="width:120px"></label></div>
       <div><div style="margin-bottom:6px">Thinking (reasoning) models <span class="muted">· detected from Ollama. Off is faster; turn on only where you want deeper answers.</span></div>
         ${thinkers.length ? thinkers.map(m => `<label class="check"><input type="checkbox" data-th="${esc(m.name)}" ${(s.think || {})[m.name] ? 'checked' : ''}> 🧠 ${esc(m.name)}</label>`).join('') : '<span class="muted">None of the installed models supports thinking.</span>'}</div>
+      <label class="check"><input type="checkbox" id="stTray" ${s.close_to_tray ? 'checked' : ''}> Keep running in the system tray when I close the window <span class="muted">· open or quit from the tray icon</span></label>
       <label>Protected paths (one per line). Nothing under these can be removed through the app.<br><textarea id="stProt" rows="5" style="width:100%">${esc(s.protected.join('\n'))}</textarea></label>
       <div class="row"><button class="btn primary" id="stSave">Save</button><button class="btn" id="stTest">Test Ollama connection</button></div>
       <div class="muted">Built-in protections that cannot be turned off: Windows, Program Files, ProgramData\\Microsoft, system files, drive roots, and your core user folders.</div>
     </div></div>`;
   $('#stSave').onclick = async () => {
     const th = {}; $$('input[data-th]').forEach(c => th[c.dataset.th] = c.checked);
-    const ns = { ...S.settings, think: { ...(S.settings.think || {}), ...th }, ollama_host: $('#stHost').value.trim(), model: $('#stModel').value, lang: $('#stLang').value, quarantine_days: Math.max(0, +$('#stDays').value || 0), protected: $('#stProt').value.split('\n').map(x => x.trim()).filter(Boolean) };
+    const ns = { ...S.settings, think: { ...(S.settings.think || {}), ...th }, ollama_host: $('#stHost').value.trim(), model: $('#stModel').value, lang: $('#stLang').value, quarantine_days: Math.max(0, +$('#stDays').value || 0), close_to_tray: $('#stTray').checked, protected: $('#stProt').value.split('\n').map(x => x.trim()).filter(Boolean) };
     S.settings = await invoke('set_settings', { settings: ns });
     toast('Settings saved'); refreshBadges();
   };
